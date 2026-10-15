@@ -1,19 +1,17 @@
 import joblib
 
+from evaluation import scoring, print_score, compare, compare_risk_groups, lorenz_gini
+
 N_CORES = joblib.cpu_count(only_physical_cores=True)
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_poisson_deviance,
-    r2_score
-)
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
@@ -28,23 +26,15 @@ class ClaimNumberModel:
             X
         ) * exposure
 
-def scoring(actual, pred, sample_weight=None):
-    return {'mae': mean_absolute_error(actual, pred, sample_weight=sample_weight),
-            'mpe': mean_poisson_deviance(actual, pred, sample_weight=sample_weight),
-            'r2': r2_score(actual, pred, sample_weight=sample_weight)}
-
-def print_score(score):
-    print(f"MAE: {score['mae']:.2f}, MPD: {score['mpe']:.2f}, R2: {score['r2']:.2f}")
-
 def glm_model(data):
     """
     Returns a trained Poisson Generalized Linear model for the *claim frequency*
     :param data:
-    :return:
+    :return: smf.glm()
     """
     model = smf.glm(
         formula=(
-            "ClaimNb ~ C(VehPower) + VehAge + DrivAge + BonusMalus"
+            "ClaimNb ~ C(VehPower) + VehAge + DrivAge + np.square(DrivAge) + BonusMalus"
             " + C(VehBrand) + C(VehGas) + C(Area) + C(Region)"
             " + np.log(Density)"
         ),
@@ -74,43 +64,49 @@ def gbm_model(data):
         HistGradientBoostingRegressor(
             loss="poisson",
             categorical_features=[0,1,2,3],
+            learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=50, early_stopping=True, l2_regularization=True
         ),
     )
     y = data["ClaimNb"] / data["Exposure"]
     tree_model.fit(data.drop(columns=["ClaimNb","Exposure"]), y, histgradientboostingregressor__sample_weight=data["Exposure"])
     return ClaimNumberModel(tree_model)
 
+
 def main():
     data = pd.read_csv('freMTPL2freq.csv', sep=',', index_col=0)
     data["ClaimNb"] = data["ClaimNb"].clip(upper=4)
     data["Exposure"] = data["Exposure"].clip(upper=1)
-    train, test = train_test_split(data, test_size=0.2, random_state=42)
+    train, test = train_test_split(data, test_size=0.2, random_state=41)
 
     glm = glm_model(train)
     gbm = gbm_model(train)
 
-    print("Target mean:", test["ClaimNb"].mean())
+    freq = train["ClaimNb"].sum() / train["Exposure"].sum()
 
     gbm_pred = gbm.predict(test.drop(columns=["ClaimNb"]))
     glm_pred = glm.predict(test.drop(columns=["ClaimNb"]))
 
-    print("GBM mean:", gbm_pred.mean())
-    print_score(scoring(test["ClaimNb"], gbm_pred))
-    compare_risk_groups(gbm_pred, test)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    evaluate_model(freq, test["Exposure"] * freq, test, "baseline", ax)
+    evaluate_model(freq, gbm_pred, test, "GBM", ax)
+    evaluate_model(freq, glm_pred, test, "GLM", ax)
 
-    print("GLM mean:", glm_pred.mean())
-    print_score(scoring(test["ClaimNb"], glm_pred))
-    compare_risk_groups(glm_pred, test)
+    print("GBM vs GLM", compare(test["ClaimNb"], gbm_pred, glm_pred))
+    ax.set_title("Cumulative claims sorted by model")
+    ax.legend()
+    plt.show()
 
-def compare_risk_groups(pred_count, test):
-    comparison = test[["ClaimNb", "Exposure"]].copy()
-    comparison["predicted_claims"] = pred_count
-    comparison["risk_group"] = pd.qcut(pred_count / test["Exposure"], q=10, duplicates="drop")
-    comparison["rate"] = pred_count / test["Exposure"]
-    print(comparison.groupby("risk_group", observed=True).agg(
-        actual_claims=("ClaimNb", "sum"),
-        predicted_claims=("predicted_claims", "sum"),
-        exposure=("Exposure", "sum")))
+def evaluate_model(freq, pred, test, name, ax=None):
+    print(f"{name} mean:", pred.mean())
+    print_score(scoring(test["ClaimNb"], pred))
+    if name != "baseline":
+        print(f"{name} vs baseline", compare(test["ClaimNb"], freq * test["Exposure"], pred))
+    compare_risk_groups(pred, test)
+    cum_exposure, cum_claim, gini = lorenz_gini(test["ClaimNb"].to_numpy(), pred, test["Exposure"].to_numpy())
+    print(f"{name} Gini:", gini)
+    if ax:
+        ax.plot(cum_exposure, cum_claim, label=name)
+
 
 if __name__ == '__main__':
     main()
